@@ -255,7 +255,6 @@ cat > /usr/local/etc/xray/config.json << EOF
 	"outbounds": [
 		{
 			"tag": "direct",
-			"sendThrough": "$SERVERIPV6_CIDR",
 			"protocol": "freedom",
 			"settings": { "domainStrategy": "UseIPv6" }
 		},
@@ -299,8 +298,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-#systemctl enable ip-rotator.service
-#systemctl start ip-rotator.service
+systemctl enable ip-rotator.service
+systemctl start ip-rotator.service
 systemctl restart xray
 
 # --- 7. 生成客户端 TUN 配置 (config.json) ---
@@ -399,7 +398,7 @@ echo -e "Short ID: $SHORT_ID"
 echo -e "SNI: $SERVER_NAME"
 echo -e "\n${YELLOW}客户端配置文件已生成: $CLIENT_CONFIG_PATH${NC}"
 echo -e "${YELLOW}可直接复制该文件到客户端 Xray 目录使用。${NC}"
-#echo -e "\n${GREEN}监控服务状态：${NC}"
-#systemctl status ip-rotator --no-pager --lines=0
+echo -e "\n${GREEN}监控服务状态：${NC}"
+systemctl status ip-rotator --no-pager --lines=0
 
 echo -e "\n${GREEN}部署完毕！${NC}"
