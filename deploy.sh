@@ -318,7 +318,12 @@ cat > "$CLIENT_CONFIG_PATH" << EOF
 				"name": "xray0",
 				"mtu": 1500,
 				"gateway": ["10.0.0.1/16", "fc00::1/64"],
-				"dns": ["1.1.1.1", "8.8.8.8"],
+				"dns": [
+					"2001:4860:4860:0:0:0:0:8888",
+					"2001:4860:4860:0:0:0:0:8844",
+					"1.1.1.1", 
+					"8.8.8.8"
+				],
 				"userLevel": 0,
 				"autoSystemRoutingTable": ["0.0.0.0/0", "::/0"],
 				"autoOutboundsInterface": "enp6s0"
