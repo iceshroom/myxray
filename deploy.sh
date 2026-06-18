@@ -19,8 +19,8 @@ GITHUB_REPO="iceshroom/myxray"            # 你的GitHub仓库
 PYTHON_SCRIPT_NAME="ip_rotator.py"              # Python脚本文件名
 XRAY_PORT=443                                   # Xray监听端口
 REALITY_DEST="www.microsoft.com:443"            # Reality伪装目标
-SERVER_NAMES=("www.microsoft.com" "microsoft.com") # SNI列表
-SERVERS_JSON='["www.microsoft.com", "microsoft.com"]'
+SERVER_NAME="www.microsoft.com" # SNI列表
+SERVERS_JSON='["www.microsoft.com"]'
 SHORT_ID=""                                     # 留空自动生成
 CLIENT_CONFIG_PATH="$HOME/myxray/client-config.json"          # 客户端配置输出路径
 
@@ -235,7 +235,7 @@ cat > "$CLIENT_CONFIG_PATH" << EOF
 				},
 				"security": "reality",
 				"realitySettings": {
-					"serverName": "${SERVER_NAMES[0]}",
+					"serverName": "$SERVER_NAME",
 					"fingerprint": "chrome",
 					"publicKey": "$PUBLIC_KEY",
 					"shortId": "$SHORT_ID"
@@ -280,7 +280,7 @@ echo -e "UUID: $UUID"
 echo -e "Flow: xtls-rprx-vision"
 echo -e "公钥: $PUBLIC_KEY"
 echo -e "Short ID: $SHORT_ID"
-echo -e "SNI: ${SERVER_NAMES[0]}"
+echo -e "SNI: $SERVER_NAME"
 echo -e "\n${YELLOW}客户端配置文件已生成: $CLIENT_CONFIG_PATH${NC}"
 echo -e "${YELLOW}可直接复制该文件到客户端 Xray 目录使用。${NC}"
 echo -e "\n${GREEN}监控服务状态：${NC}"
