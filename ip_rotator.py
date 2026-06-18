@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-IPv6 Traffic Monitor & Address Rotator
-- Prefers IPv6 for outgoing connections
+IPv6 Traffic Monitor & Address Rotator (Pure Address Swap)
+- Sets IPv6 preference for outgoing connections
 - Monitors IPv6 download traffic via ip6tables
-- Rotates IPv6 address when traffic exceeds 2GB
+- Rotates IPv6 address by ADD NEW + DEL OLD (without touching routing table)
 """
 
 import subprocess
@@ -17,8 +17,8 @@ import atexit
 import os
 
 # ---------- Configuration ----------
-THRESHOLD = 2 * 1024**3          # 2 GB (bytes)
-CHECK_INTERVAL = 10              # seconds
+THRESHOLD = 2 * 1024 ** 3          # 2 GB (bytes)
+CHECK_INTERVAL = 10                # seconds
 # -----------------------------------
 
 logging.basicConfig(
@@ -189,53 +189,51 @@ def generate_new_ipv6_address(existing_addrs, prefix_len=64):
 
 
 def replace_ipv6_address():
-    """Replace the current managed IPv6 address with a new one."""
-    global current_addr, gateway, iface
+    """
+    Rotate the IPv6 address by adding a new one and deleting the old one.
+    Does NOT touch the routing table (relies on kernel's source address selection).
+    """
+    global current_addr, iface, total_traffic
 
+    # 1. Get current list of addresses
     all_addrs = get_global_ipv6_addresses(iface)
     if not all_addrs:
-        logger.error("No global IPv6 addresses found, cannot replace")
+        logger.error("No global IPv6 addresses found on %s, cannot rotate", iface)
         return False
 
+    # 2. Generate a new unique address
     new_addr = generate_new_ipv6_address(all_addrs)
-    logger.info("Adding new address: %s", new_addr)
+    logger.info("Generated new address: %s", new_addr)
 
-    # Add the new address
+    # 3. Add the new address (with nodad to skip DAD and avoid 'tentative' state)
     try:
-        subprocess.run(['ip', '-6', 'addr', 'add', new_addr, 'dev', iface],
-                       check=True)
+        result = subprocess.run(
+            ['ip', '-6', 'addr', 'add', new_addr, 'dev', iface, 'nodad'],
+            capture_output=True, text=True, check=True
+        )
+        logger.info("Successfully added new address: %s", new_addr)
     except subprocess.CalledProcessError as e:
-        logger.error("Failed to add address: %s", e)
+        logger.error("Failed to add new address: %s", e.stderr)
         return False
 
-    # Update default route source to new address
-    if gateway is None:
-        gateway, _, _ = get_default_gateway_and_src()
-        if gateway is None:
-            logger.error("Cannot determine gateway, route update skipped")
-    else:
-        new_ip = new_addr.split('/')[0]
-        try:
-            subprocess.run(
-                ['ip', '-6', 'route', 'replace', 'default', 'via', gateway,
-                 'dev', iface, 'src', new_ip],
-                check=True
-            )
-            logger.info("Default route source updated to %s", new_ip)
-        except subprocess.CalledProcessError as e:
-            logger.warning("Failed to update default route: %s", e)
-
-    # Delete the old address
+    # 4. Delete the old address (if it exists)
     old_addr = current_addr
     if old_addr:
         try:
-            subprocess.run(['ip', '-6', 'addr', 'del', old_addr, 'dev', iface],
-                           check=True)
-            logger.info("Deleted old address: %s", old_addr)
+            subprocess.run(
+                ['ip', '-6', 'addr', 'del', old_addr, 'dev', iface],
+                capture_output=True, text=True, check=True
+            )
+            logger.info("Successfully deleted old address: %s", old_addr)
         except subprocess.CalledProcessError as e:
-            logger.warning("Failed to delete old address %s: %s", old_addr, e)
+            # This is not fatal, but we log it. The old address might have been
+            # removed by something else, or has dependencies.
+            logger.warning("Failed to delete old address %s: %s", old_addr, e.stderr)
 
+    # 5. Update global state and reset traffic counter
     current_addr = new_addr
+    total_traffic = 0
+    logger.info("Address rotation completed. New managed address: %s", current_addr)
     return True
 
 
@@ -256,38 +254,55 @@ def main():
 
     # 2. Get default route details
     gateway, src, iface = get_default_gateway_and_src()
-    if iface is None:
-        logger.error("Could not determine default interface")
+    if iface is None or gateway is None:
+        logger.error("Could not determine default interface or gateway")
         sys.exit(1)
     logger.info("Default interface: %s, gateway: %s", iface, gateway)
 
-    # 3. Get current global IPv6 addresses
+    # 3. CRITICAL: Remove the 'src' pinning from the default route if it exists.
+    #    This allows the kernel to automatically use the new IP after we delete the old one.
+    if src:
+        logger.info("Removing 'src %s' pinning from default route...", src)
+        try:
+            subprocess.run(
+                ['ip', '-6', 'route', 'replace', 'default', 'via', gateway, 'dev', iface],
+                check=True, capture_output=True, text=True
+            )
+            logger.info("Default route updated (src constraint removed).")
+        except subprocess.CalledProcessError as e:
+            logger.error("Failed to update default route: %s", e.stderr)
+            sys.exit(1)
+    else:
+        logger.info("Default route has no 'src' constraint. Good to go.")
+
+    # 4. Get current global IPv6 addresses
     addrs = get_global_ipv6_addresses(iface)
     if not addrs:
         logger.error("No global IPv6 address found on %s", iface)
         sys.exit(1)
     logger.info("Current IPv6 addresses: %s", addrs)
 
-    # Determine the address we will manage
+    # Determine the address we will manage (prefer the one used as src in route, else pick first)
     if src and any(src == a.split('/')[0] for a in addrs):
         for a in addrs:
             if a.startswith(src + '/'):
                 current_addr = a
                 break
-    else:
+    if current_addr is None:
         current_addr = addrs[0]
     logger.info("Managed address: %s", current_addr)
 
-    # 4. Set up traffic counting
+    # 5. Set up traffic counting
     setup_iptables()
     atexit.register(cleanup_iptables)
 
     last_count = get_download_bytes()
     total_traffic = 0
 
-    logger.info("Monitoring started (threshold = %d bytes)", THRESHOLD)
+    logger.info("Monitoring started (threshold = %d bytes, %d GB)",
+                THRESHOLD, THRESHOLD // (1024 ** 3))
 
-    # 5. Main loop
+    # 6. Main loop
     while running:
         time.sleep(CHECK_INTERVAL)
         if not running:
@@ -301,24 +316,25 @@ def main():
                     logger.warning("Counter decreased (possibly reset), ignoring")
                     delta = 0
                 total_traffic += delta
-                logger.debug("Delta: %d, total: %d", delta, total_traffic)
+                logger.debug("Delta: %d bytes, Total: %d bytes (%.2f GB)",
+                             delta, total_traffic, total_traffic / (1024 ** 3))
 
                 if total_traffic >= THRESHOLD:
-                    logger.info("Threshold reached! Total traffic: %d bytes",
-                                total_traffic)
+                    logger.info("Threshold reached! Total traffic: %d bytes (%.2f GB)",
+                                total_traffic, total_traffic / (1024 ** 3))
                     if replace_ipv6_address():
-                        total_traffic = 0
-                        last_count = current_count
-                        logger.info("Address rotated, counter reset")
+                        # Reset last_count to current count after rotation
+                        last_count = get_download_bytes()
+                        logger.info("Counter reset after rotation.")
                     else:
-                        logger.error("Address rotation failed, counter not reset")
+                        logger.error("Address rotation failed. Counter not reset.")
             else:
                 last_count = current_count
 
         except Exception as e:
             logger.exception("Error in monitoring loop: %s", e)
 
-    logger.info("Exiting")
+    logger.info("Exiting gracefully")
 
 
 if __name__ == '__main__':
