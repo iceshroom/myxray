@@ -24,6 +24,122 @@ SERVERS_JSON='["www.microsoft.com"]'
 SHORT_ID=""                                     # 留空自动生成
 CLIENT_CONFIG_PATH="$HOME/myxray/client-config.json"          # 客户端配置输出路径
 
+
+#!/bin/bash
+
+# 展开 IPv6 地址为 8 组四位十六进制数（小写）
+expand_ipv6() {
+    local addr="$1"
+    addr="${addr%/*}"          # 去掉前缀长度
+    addr="${addr%\%*}"         # 去掉 zone 标识（如有）
+    local parts=()
+    local expanded=()
+
+    if [[ "$addr" == *::* ]]; then
+        IFS=: read -ra parts <<< "$addr"
+        # 收集非空部分
+        local nonempty=()
+        for p in "${parts[@]}"; do
+            [[ -n "$p" ]] && nonempty+=("$p")
+        done
+        local count=${#nonempty[@]}
+        local missing=$((8 - count))
+        # 按顺序填充
+        for p in "${parts[@]}"; do
+            if [[ -z "$p" ]]; then
+                for ((j=0; j<missing; j++)); do
+                    expanded+=("0000")
+                done
+            else
+                printf -v p "%04s" "$p"
+                expanded+=("${p// /0}")
+            fi
+        done
+    else
+        IFS=: read -ra parts <<< "$addr"
+        for p in "${parts[@]}"; do
+            printf -v p "%04s" "$p"
+            expanded+=("${p// /0}")
+        done
+        # 补齐到 8 组（理论上无 :: 时应有 8 组）
+        while [[ ${#expanded[@]} -lt 8 ]]; do
+            expanded+=("0000")
+        done
+    fi
+    echo "${expanded[@]}"
+}
+
+# 压缩 8 组 IPv6 地址（小写）为标准紧凑形式
+compress_ipv6_groups() {
+    local groups=("$@")
+    local max_start=-1 max_len=0
+    local cur_start=-1 cur_len=0
+
+    # 寻找最长连续零组
+    for i in "${!groups[@]}"; do
+        if [[ "${groups[i]}" == "0000" ]]; then
+            if [[ $cur_start -eq -1 ]]; then
+                cur_start=$i
+                cur_len=1
+            else
+                ((cur_len++))
+            fi
+        else
+            if [[ $cur_len -gt $max_len ]]; then
+                max_len=$cur_len
+                max_start=$cur_start
+            fi
+            cur_start=-1
+            cur_len=0
+        fi
+    done
+    if [[ $cur_len -gt $max_len ]]; then
+        max_len=$cur_len
+        max_start=$cur_start
+    fi
+
+    local result=()
+    if [[ $max_len -ge 2 ]]; then
+        for ((i=0; i<${#groups[@]}; i++)); do
+            if [[ $i -eq $max_start ]]; then
+                result+=("")
+                i=$((i + max_len - 1))
+            else
+                local trimmed="${groups[i]#${groups[i]%%[!0]*}}"
+                [[ -z "$trimmed" ]] && trimmed="0"
+                result+=("$trimmed")
+            fi
+        done
+    else
+        for g in "${groups[@]}"; do
+            local trimmed="${g#${g%%[!0]*}}"
+            [[ -z "$trimmed" ]] && trimmed="0"
+            result+=("$trimmed")
+        done
+    fi
+
+    local output
+    output=$(IFS=:; echo "${result[*]}")
+    # 处理开头或结尾的空段（生成 ::）
+    [[ "${result[0]}" == "" ]] && output=":$output"
+    [[ "${result[-1]}" == "" ]] && output="$output:"
+    echo "$output"
+}
+
+# 主函数：输入 IPv6 地址，输出 /64 网络 CIDR
+ipv6_to_cidr64() {
+    local input="$1"
+    # 展开为完整 8 组
+    local expanded=($(expand_ipv6 "$input"))
+    # 取前 4 组（64 位），后 4 组置零
+    local prefix_groups=("${expanded[@]:0:4}")
+    local all_groups=("${prefix_groups[@]}" "0000" "0000" "0000" "0000")
+    # 压缩并输出
+    local compressed=$(compress_ipv6_groups "${all_groups[@]}")
+    echo "${compressed}/64"
+}
+
+
 # --- 检查root ---
 if [[ $EUID -ne 0 ]]; then
    echo -e "${RED}错误：此脚本必须以root权限运行！${NC}" 
@@ -44,7 +160,9 @@ if [[ -z "$IPV6_ADDR" ]]; then
     echo -e "${RED}错误：未找到公网 IPv6 地址，请确认网卡已配置 IPv6。${NC}"
     exit 1
 fi
+SERVERIPV6_CIDR=$(ipv6_to_cidr64 $IPV6_ADDR)
 echo -e "${GREEN}当前 IPv6 地址: $IPV6_ADDR${NC}"
+echo -e "${GREEN}当前 IPv6 CIDR: $SERVERIPV6_CIDR${NC}"
 
 # 提取 /64 前缀（去掉最后一段，末尾加 ::）
 IPV6_PREFIX=$(echo "$IPV6_ADDR" | sed 's/:[^:]*$//')":"
@@ -137,6 +255,7 @@ cat > /usr/local/etc/xray/config.json << EOF
 	"outbounds": [
 		{
 			"tag": "direct",
+			"sendThrough": "$SERVERIPV6_CIDR",
 			"protocol": "freedom",
 			"settings": { "domainStrategy": "UseIPv6" }
 		},
@@ -180,8 +299,8 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable ip-rotator.service
-systemctl start ip-rotator.service
+#systemctl enable ip-rotator.service
+#systemctl start ip-rotator.service
 systemctl restart xray
 
 # --- 7. 生成客户端 TUN 配置 (config.json) ---
