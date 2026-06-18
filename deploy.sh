@@ -138,11 +138,6 @@ cat > /usr/local/etc/xray/config.json << EOF
 		{
 			"tag": "direct",
 			"protocol": "freedom",
-			"settings": {}
-		},
-		{
-			"tag": "mega_out",
-			"protocol": "freedom",
 			"settings": { "domainStrategy": "UseIPv6" }
 		},
 		{
