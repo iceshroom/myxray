@@ -386,6 +386,8 @@ cat > "$CLIENT_CONFIG_PATH" << EOF
 }
 EOF
 
+ufw allow $XRAY_PORT
+
 # --- 9. 输出客户端配置信息 ---
 echo -e "\n${GREEN}========== 部署完成！客户端配置 ==========${NC}"
 echo -e "服务端地址: $SERVER_IP"
@@ -397,7 +399,7 @@ echo -e "Short ID: $SHORT_ID"
 echo -e "SNI: $SERVER_NAME"
 echo -e "\n${YELLOW}客户端配置文件已生成: $CLIENT_CONFIG_PATH${NC}"
 echo -e "${YELLOW}可直接复制该文件到客户端 Xray 目录使用。${NC}"
-echo -e "\n${GREEN}监控服务状态：${NC}"
-systemctl status ip-rotator --no-pager --lines=0
+#echo -e "\n${GREEN}监控服务状态：${NC}"
+#systemctl status ip-rotator --no-pager --lines=0
 
 echo -e "\n${GREEN}部署完毕！${NC}"
