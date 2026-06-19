@@ -17,7 +17,7 @@ import atexit
 import os
 
 # ---------- Configuration ----------
-THRESHOLD = 2 * 1024 ** 3          # 2 GB (bytes)
+THRESHOLD = 4 * 1024 ** 3          # 4 GB (bytes)
 CHECK_INTERVAL = 10                # seconds
 # -----------------------------------
 
