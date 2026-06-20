@@ -1,341 +1,394 @@
 #!/usr/bin/env python3
 """
-IPv6 Traffic Monitor & Address Rotator (Pure Address Swap)
-- Sets IPv6 preference for outgoing connections
-- Monitors IPv6 download traffic via ip6tables
-- Rotates IPv6 address by ADD NEW + DEL OLD (without touching routing table)
+IPv6 地址自动轮换守护进程（基于流量阈值）
+- 自动检测网络接口和 /64 前缀
+- 启动时检查系统 IPv6 优先级，异常时自动修正
+- 监控当前 IPv6 地址的入+出流量（通过 ip6tables）
+- 超阈值时自动切换新地址，旧地址优雅弃用并延迟删除
+- 使用连接跟踪（conntrack）判断旧地址是否仍活跃，避免中断长连接
+- 非阻塞轮询设计，适合作为 systemd 服务长期运行
+- 所有输出通过 logging 记录，便于 journalctl 查看
 """
 
 import subprocess
 import time
-import ipaddress
 import random
+import re
 import sys
-import signal
-import logging
-import atexit
 import os
+import logging
+from datetime import datetime, timedelta
+import ipaddress
+import shutil
 
-# ---------- Configuration ----------
-THRESHOLD = 4 * 1024 ** 3          # 4 GB (bytes)
-CHECK_INTERVAL = 10                # seconds
-# -----------------------------------
+# ================== 可配置参数 ==================
+THRESHOLD_BYTES = 4 * 1024 ** 3        # 触发切换的流量阈值（4GB）
+CHECK_INTERVAL = 60                    # 主循环检查间隔（秒）
+GRACE_PERIOD = 300                     # 旧 IP 宽限期（秒），超时后强制删除
+VALID_LFT = 3600                       # 旧 IP 的有效生存时间（秒），需大于 GRACE_PERIOD
+# ===============================================
 
+# 配置日志（输出到 stdout，systemd 会捕获到 journal）
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
 )
-logger = logging.getLogger('ipv6_monitor')
+logger = logging.getLogger(__name__)
 
-# Global state
-current_addr = None      # e.g. "2001:db8:1::1234/64"
-gateway = None
-iface = None
-last_count = None
-total_traffic = 0
-running = True
+# 全局状态
+current_ip = None
+old_ips = []  # 元素为字典：{'ip': str, 'expire_at': datetime}
+INTERFACE = None
+IPV6_PREFIX = None
 
-
-def setup_ipv6_preference():
-    """Make IPv6 preferred over IPv4 for outgoing connections."""
-    # Enable IPv6 (just in case)
-    subprocess.run(['sysctl', '-w', 'net.ipv6.conf.all.disable_ipv6=0'],
-                   stderr=subprocess.DEVNULL, check=False)
-    subprocess.run(['sysctl', '-w', 'net.ipv6.conf.default.disable_ipv6=0'],
-                   stderr=subprocess.DEVNULL, check=False)
-
-    # Lower priority of IPv4-mapped addresses in gai.conf
-    gai_file = '/etc/gai.conf'
+def run_cmd(cmd, check=False):
+    """执行 shell 命令，返回 stdout 字符串"""
     try:
-        with open(gai_file, 'r') as f:
-            content = f.read()
-        if 'precedence ::ffff:0:0/96' not in content:
-            with open(gai_file, 'a') as f:
-                f.write('\n# Added by ipv6_monitor\nprecedence ::ffff:0:0/96  10\n')
-            logger.info("Updated /etc/gai.conf to prefer IPv6")
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        if check and result.returncode != 0:
+            logger.error(f"命令执行失败: {cmd}\n{result.stderr}")
+            sys.exit(1)
+        return result.stdout.strip()
     except Exception as e:
-        logger.warning("Could not modify /etc/gai.conf: %s", e)
+        logger.error(f"执行命令异常: {cmd}\n{e}")
+        if check:
+            sys.exit(1)
+        return ""
 
-    # Disable temporary addresses to keep our address management clean
-    iface = get_default_interface()
-    if iface:
-        subprocess.run(
-            ['sysctl', '-w', f'net.ipv6.conf.{iface}.use_tempaddr=0'],
-            stderr=subprocess.DEVNULL, check=False
-        )
+def ensure_ipv6_preference():
+    """
+    确保系统优先使用 IPv6。
+    由于 glibc 默认已是 IPv6 优先（::/0 优先级 40 > ::ffff:0:0/96 优先级 10），
+    本函数仅检查是否存在反向配置（即 IPv4 映射地址优先级高于 IPv6），
+    若发现异常则修正；否则保持默认，不做任何改动。
+    """
+    gai_path = "/etc/gai.conf"
+    logger.info("检查系统 IPv6 优先级设置...")
 
+    if not os.path.exists(gai_path):
+        logger.info("/etc/gai.conf 不存在，系统将使用 glibc 默认规则（默认 IPv6 优先）")
+        return
 
-def get_default_interface():
-    """Return the interface of the default IPv6 route."""
     try:
-        out = subprocess.check_output(['ip', '-6', 'route', 'show', 'default'],
-                                      text=True)
-    except subprocess.CalledProcessError:
-        logger.error("No default IPv6 route found")
+        with open(gai_path, 'r') as f:
+            content = f.read()
+    except Exception as e:
+        logger.error(f"读取 {gai_path} 失败: {e}，将保持原有配置")
+        return
+
+    lines = content.split('\n')
+    ipv6_prec = None
+    ipv4map_prec = None
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('precedence'):
+            parts = line.split()
+            if len(parts) >= 3:
+                prefix = parts[1]
+                try:
+                    val = int(parts[2])
+                except ValueError:
+                    continue
+                if prefix == '::/0':
+                    ipv6_prec = val
+                elif prefix == '::ffff:0:0/96':
+                    ipv4map_prec = val
+
+    if ipv6_prec is not None and ipv4map_prec is not None:
+        if ipv6_prec > ipv4map_prec:
+            logger.info(f"系统已配置为 IPv6 优先（::/0 优先级 {ipv6_prec} > ::ffff:0:0/96 优先级 {ipv4map_prec}）")
+            return
+        else:
+            logger.warning(f"检测到异常配置：IPv4 映射地址优先级 ({ipv4map_prec}) 高于或等于 IPv6 ({ipv6_prec})，将进行修正")
+    else:
+        logger.info("未在 /etc/gai.conf 中找到显式优先级配置，系统将使用 glibc 默认值（默认 IPv6 优先）")
+        return
+
+    # 执行修正
+    backup_path = gai_path + ".bak." + datetime.now().strftime("%Y%m%d%H%M%S")
+    try:
+        shutil.copy2(gai_path, backup_path)
+        logger.info(f"已备份原文件到 {backup_path}")
+    except Exception as e:
+        logger.error(f"备份失败: {e}，放弃修改")
+        return
+
+    try:
+        with open(gai_path, 'a') as f:
+            f.write("\n# Corrected by ipv6_rotator: force IPv6 preference\n")
+            f.write("precedence ::/0 100\n")
+            f.write("precedence ::ffff:0:0/96 10\n")
+        logger.info("已修正 /etc/gai.conf，强制 IPv6 优先（::/0 优先级 100 > ::ffff:0:0/96 优先级 10）")
+    except Exception as e:
+        logger.error(f"写入 {gai_path} 失败: {e}，恢复备份")
+        shutil.copy2(backup_path, gai_path)
+        return
+
+    logger.info("IPv6 优先配置已生效。当前已运行的进程不受影响，新启动的进程将优先使用 IPv6。")
+
+def auto_detect_interface_and_prefix():
+    """
+    自动检测默认路由接口，并从该接口获取第一个全局 IPv6 地址，提取 /64 前缀。
+    若无默认路由，则遍历所有接口，选择第一个有全局 IPv6 地址的接口。
+    返回 (interface, prefix)
+    """
+    out = run_cmd("ip -6 route show default")
+    if out:
+        match = re.search(r'dev\s+(\S+)', out)
+        if match:
+            iface = match.group(1)
+            logger.info(f"通过默认路由检测到接口: {iface}")
+            addr_out = run_cmd(f"ip -6 addr show dev {iface} scope global")
+            if addr_out:
+                match_addr = re.search(r'inet6 ([0-9a-f:]+)/(\d+)', addr_out)
+                if match_addr:
+                    addr_str = match_addr.group(1)
+                    prefix_len = int(match_addr.group(2))
+                    if prefix_len == 64:
+                        prefix = get_prefix_from_address(addr_str, 64)
+                        return iface, prefix
+                    else:
+                        logger.warning(f"接口 {iface} 地址 {addr_str} 的前缀长度不是 /64，而是 /{prefix_len}，将截取为 /64")
+                        prefix = get_prefix_from_address(addr_str, 64)
+                        if prefix:
+                            return iface, prefix
+                        else:
+                            logger.error("无法从地址生成 /64 前缀")
+                else:
+                    logger.warning(f"接口 {iface} 虽然有全局地址，但解析失败")
+            else:
+                logger.warning(f"默认路由接口 {iface} 没有全局 IPv6 地址，尝试其他接口")
+
+    logger.info("未从默认路由获取到有效接口，尝试遍历所有接口...")
+    out = run_cmd("ip -6 addr show scope global")
+    if not out:
+        logger.error("系统中没有任何全局 IPv6 地址")
         sys.exit(1)
-    lines = out.strip().splitlines()
-    if not lines:
-        logger.error("No default IPv6 route")
-        sys.exit(1)
-    parts = lines[0].split()
-    if 'dev' in parts:
-        idx = parts.index('dev')
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
-    logger.error("Could not parse interface from default route: %s", lines[0])
+
+    lines = out.split('\n')
+    current_iface = None
+    for line in lines:
+        iface_match = re.match(r'\d+:\s+(\S+):', line)
+        if iface_match:
+            current_iface = iface_match.group(1)
+        addr_match = re.search(r'inet6 ([0-9a-f:]+)/(\d+)', line)
+        if addr_match and current_iface:
+            addr_str = addr_match.group(1)
+            prefix_len = int(addr_match.group(2))
+            logger.info(f"在接口 {current_iface} 上找到地址 {addr_str}/{prefix_len}")
+            prefix = get_prefix_from_address(addr_str, 64)
+            if prefix:
+                return current_iface, prefix
+            else:
+                logger.error(f"无法从地址 {addr_str} 生成 /64 前缀")
+                sys.exit(1)
+
+    logger.error("未能成功检测到可用的接口和 /64 前缀")
     sys.exit(1)
 
-
-def get_default_gateway_and_src():
-    """Return (gateway, source_ip, interface) from the default route."""
-    out = subprocess.check_output(['ip', '-6', 'route', 'show', 'default'],
-                                  text=True)
-    line = out.strip().splitlines()[0]
-    parts = line.split()
-    gateway = None
-    src = None
-    iface = None
-    if 'via' in parts:
-        idx = parts.index('via')
-        if idx + 1 < len(parts):
-            gateway = parts[idx + 1]
-    if 'dev' in parts:
-        idx = parts.index('dev')
-        if idx + 1 < len(parts):
-            iface = parts[idx + 1]
-    if 'src' in parts:
-        idx = parts.index('src')
-        if idx + 1 < len(parts):
-            src = parts[idx + 1]
-    return gateway, src, iface
-
-
-def get_global_ipv6_addresses(iface):
-    """Return list of global IPv6 addresses (with prefix) on the interface."""
-    addrs = []
+def get_prefix_from_address(addr_str, prefix_len=64):
     try:
-        out = subprocess.check_output(
-            ['ip', '-6', 'addr', 'show', 'dev', iface, 'scope', 'global'],
-            text=True
-        )
-    except subprocess.CalledProcessError:
-        return addrs
-    for line in out.splitlines():
-        if 'inet6' in line:
-            parts = line.strip().split()
-            # parts: ['inet6', '2001:db8:1::1234/64', 'scope', 'global', ...]
-            if len(parts) >= 2:
-                addrs.append(parts[1])
-    return addrs
+        if '/' in addr_str:
+            addr_obj = ipaddress.IPv6Interface(addr_str)
+        else:
+            addr_obj = ipaddress.IPv6Interface(f"{addr_str}/{prefix_len}")
+        exploded = addr_obj.ip.exploded
+        parts = exploded.split(':')
+        prefix_parts = parts[:4]
+        while len(prefix_parts) < 4:
+            prefix_parts.append('0000')
+        prefix_str = ':'.join(prefix_parts) + '::'
+        return prefix_str
+    except Exception as e:
+        logger.error(f"解析 IPv6 地址 '{addr_str}' 失败: {e}")
+        return None
 
+def get_current_global_ip():
+    global INTERFACE
+    if not INTERFACE:
+        logger.error("INTERFACE 未设置")
+        return None
+    out = run_cmd(f"ip -6 addr show dev {INTERFACE} | grep inet6 | grep global")
+    match = re.search(r'inet6 ([0-9a-f:]+)/\d+', out)
+    return match.group(1) if match else None
 
-def setup_iptables():
-    """Create ip6tables chain to count IPv6 download traffic."""
-    # Create chain (ignore if exists)
-    subprocess.run(['ip6tables', '-N', 'IPV6_DOWNLOAD'],
-                   stderr=subprocess.DEVNULL, check=False)
-    subprocess.run(['ip6tables', '-F', 'IPV6_DOWNLOAD'], check=False)
-    subprocess.run(['ip6tables', '-A', 'IPV6_DOWNLOAD', '-j', 'RETURN'],
-                   check=True)
-
-    # Remove any old rule and insert at top of INPUT
-    subprocess.run(['ip6tables', '-D', 'INPUT', '-j', 'IPV6_DOWNLOAD'],
-                   stderr=subprocess.DEVNULL, check=False)
-    subprocess.run(['ip6tables', '-I', 'INPUT', '-j', 'IPV6_DOWNLOAD'],
-                   check=True)
-    logger.info("iptables rules installed")
-
-
-def cleanup_iptables():
-    """Remove the ip6tables rules."""
-    subprocess.run(['ip6tables', '-D', 'INPUT', '-j', 'IPV6_DOWNLOAD'],
-                   stderr=subprocess.DEVNULL, check=False)
-    subprocess.run(['ip6tables', '-F', 'IPV6_DOWNLOAD'], check=False)
-    subprocess.run(['ip6tables', '-X', 'IPV6_DOWNLOAD'], check=False)
-    logger.info("iptables rules removed")
-
-
-def get_download_bytes():
-    """Read the current byte count from the IPV6_DOWNLOAD chain."""
-    try:
-        out = subprocess.check_output(
-            ['ip6tables', '-L', 'IPV6_DOWNLOAD', '-v', '-n', '-x'],
-            text=True
-        )
-    except subprocess.CalledProcessError:
-        return 0
-    for line in out.splitlines():
-        if 'RETURN' in line and 'all' in line:
-            parts = line.split()
-            if len(parts) >= 2:
-                try:
-                    return int(parts[1])
-                except ValueError:
-                    pass
-    return 0
-
-
-def generate_new_ipv6_address(existing_addrs, prefix_len=64):
-    """Generate a new IPv6 address from the /64 prefix of existing_addrs."""
-    if not existing_addrs:
-        raise ValueError("No existing IPv6 addresses to derive prefix")
-    net = ipaddress.IPv6Network(existing_addrs[0], strict=False)
-    while True:
-        host = random.getrandbits(64)
-        new_addr = net.network_address + host
-        new_str = f"{new_addr}/{net.prefixlen}"
-        if new_str not in existing_addrs:
-            return new_str
-
-
-def replace_ipv6_address():
+def generate_new_ip():
     """
-    Rotate the IPv6 address by adding a new one and deleting the old one.
-    Does NOT touch the routing table (relies on kernel's source address selection).
+    从全局 IPV6_PREFIX（格式如 "2001:db8:1234:5678::"）生成一个随机的 /64 地址。
+    返回完整的 8 段 IPv6 地址（无压缩），例如 "2001:db8:1234:5678:abcd:1234:5678:9abc"
     """
-    global current_addr, iface, total_traffic
+    # 去掉末尾可能的 '::' 或 ':'，得到前4段
+    base = IPV6_PREFIX
+    if base.endswith('::'):
+        base = base[:-2]
+    elif base.endswith(':'):
+        base = base[:-1]
+    # 生成64位随机数
+    suffix_int = random.getrandbits(64)
+    # 拆成4个16位段（注意顺序，低16位是最后一段）
+    parts = []
+    for _ in range(4):
+        parts.append(f"{suffix_int & 0xffff:04x}")
+        suffix_int >>= 16
+    parts.reverse()  # 反转得到正确顺序
+    suffix = ':'.join(parts)
+    return f"{base}:{suffix}"
 
-    # 1. Get current list of addresses
-    all_addrs = get_global_ipv6_addresses(iface)
-    if not all_addrs:
-        logger.error("No global IPv6 addresses found on %s, cannot rotate", iface)
-        return False
+def setup_iptables_rule(ip, action="add"):
+    """添加或删除 ip6tables 计数规则（INPUT/OUTPUT）"""
+    if action == "add":
+        # 先尝试删除可能存在的旧规则，避免重复
+        run_cmd(f"ip6tables -D INPUT -d {ip} -j ACCEPT 2>/dev/null")
+        run_cmd(f"ip6tables -D OUTPUT -s {ip} -j ACCEPT 2>/dev/null")
+        # 添加新规则
+        run_cmd(f"ip6tables -I INPUT -d {ip} -j ACCEPT", check=True)
+        run_cmd(f"ip6tables -I OUTPUT -s {ip} -j ACCEPT", check=True)
+        logger.debug(f"已添加 {ip} 的计数规则")
+    else:  # delete
+        run_cmd(f"ip6tables -D INPUT -d {ip} 2>/dev/null")
+        run_cmd(f"ip6tables -D OUTPUT -s {ip} 2>/dev/null")
+        logger.debug(f"已删除 {ip} 的计数规则")
 
-    # 2. Generate a new unique address
-    new_addr = generate_new_ipv6_address(all_addrs)
-    logger.info("Generated new address: %s", new_addr)
+def get_traffic_for_ip(ip):
+    """
+    读取 ip6tables 中该 IP 的入+出总字节数（修复解析逻辑）
+    """
+    total = 0
+    for chain in ['INPUT', 'OUTPUT']:
+        out = run_cmd(f"ip6tables -L {chain} -v -x -n")
+        for line in out.split('\n'):
+            # 匹配包含 ACCEPT 且包含目标 IP 的行（确保是我们插入的规则）
+            if "ACCEPT" in line and ip in line:
+                parts = line.split()
+                # 格式：pkts bytes target ...，bytes 在第二个字段（索引1）
+                if len(parts) > 1 and parts[1].isdigit():
+                    total += int(parts[1])
+    return total
 
-    # 3. Add the new address (with nodad to skip DAD and avoid 'tentative' state)
+def is_ip_active_in_conntrack(ip):
     try:
-        result = subprocess.run(
-            ['ip', '-6', 'addr', 'add', new_addr, 'dev', iface, 'nodad'],
-            capture_output=True, text=True, check=True
-        )
-        logger.info("Successfully added new address: %s", new_addr)
-    except subprocess.CalledProcessError as e:
-        logger.error("Failed to add new address: %s", e.stderr)
+        with open('/proc/net/nf_conntrack', 'r') as f:
+            for line in f:
+                if f"src={ip}" in line or f"dst={ip}" in line:
+                    return True
         return False
+    except FileNotFoundError:
+        out = run_cmd(f"ss -6 -t -u -e -n | grep -E 'src={ip}|dst={ip}'")
+        return bool(out)
 
-    # 4. Delete the old address (if it exists)
-    old_addr = current_addr
-    if old_addr:
-        try:
-            subprocess.run(
-                ['ip', '-6', 'addr', 'del', old_addr, 'dev', iface],
-                capture_output=True, text=True, check=True
-            )
-            logger.info("Successfully deleted old address: %s", old_addr)
-        except subprocess.CalledProcessError as e:
-            # This is not fatal, but we log it. The old address might have been
-            # removed by something else, or has dependencies.
-            logger.warning("Failed to delete old address %s: %s", old_addr, e.stderr)
+def add_new_ip(ip):
+    run_cmd(f"ip -6 addr add {ip}/64 dev {INTERFACE}", check=True)
+    logger.info(f"已添加新 IP: {ip}")
 
-    # 5. Update global state and reset traffic counter
-    current_addr = new_addr
-    total_traffic = 0
-    logger.info("Address rotation completed. New managed address: %s", current_addr)
-    return True
+def deprecate_old_ip(ip):
+    run_cmd(f"ip -6 addr change {ip}/64 dev {INTERFACE} preferred_lft 0 valid_lft {VALID_LFT}", check=True)
+    logger.info(f"旧 IP {ip} 已弃用（preferred_lft=0），已有连接仍可继续")
 
+def delete_old_ip(ip):
+    run_cmd(f"ip -6 addr del {ip}/64 dev {INTERFACE}", check=True)
+    logger.info(f"已删除旧 IP: {ip}")
 
-def signal_handler(sig, frame):
-    global running
-    logger.info("Received signal %d, exiting...", sig)
-    running = False
+def switch_ip(old_ip):
+    new_ip = generate_new_ip()
+    while new_ip == old_ip:
+        new_ip = generate_new_ip()
 
+    logger.info(f"开始切换: {old_ip} -> {new_ip}")
+    add_new_ip(new_ip)
+    setup_iptables_rule(old_ip, action="del")
+    setup_iptables_rule(new_ip, action="add")
+    deprecate_old_ip(old_ip)
+    expire_at = datetime.now() + timedelta(seconds=GRACE_PERIOD)
+    old_ips.append({'ip': old_ip, 'expire_at': expire_at})
+    logger.info(f"旧 IP {old_ip} 将在 {GRACE_PERIOD}s 后（{expire_at.strftime('%H:%M:%S')}）被尝试删除")
+    return new_ip
+
+def process_old_ips():
+    global old_ips
+    now = datetime.now()
+    still_pending = []
+    for entry in old_ips:
+        ip = entry['ip']
+        expire_at = entry['expire_at']
+        if now >= expire_at:
+            if is_ip_active_in_conntrack(ip):
+                logger.warning(f"旧 IP {ip} 已超时但 conntrack 仍显示活跃，强制删除")
+            else:
+                logger.info(f"旧 IP {ip} 已超时且 conntrack 无活跃，安全删除")
+            setup_iptables_rule(ip, action="del")
+            delete_old_ip(ip)
+        else:
+            still_pending.append(entry)
+    old_ips = still_pending
+
+def cleanup_all(ip):
+    if ip:
+        setup_iptables_rule(ip, action="del")
+        logger.info(f"已清理 {ip} 的 ip6tables 规则")
+    for entry in old_ips:
+        setup_iptables_rule(entry['ip'], action="del")
+    logger.info("清理完成")
 
 def main():
-    global current_addr, gateway, iface, last_count, total_traffic, running
+    global current_ip, INTERFACE, IPV6_PREFIX
 
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
-
-    # 1. Prefer IPv6
-    setup_ipv6_preference()
-
-    # 2. Get default route details
-    gateway, src, iface = get_default_gateway_and_src()
-    if iface is None or gateway is None:
-        logger.error("Could not determine default interface or gateway")
+    if os.geteuid() != 0:
+        logger.error("本脚本需要 root 权限运行（请使用 sudo）")
         sys.exit(1)
-    logger.info("Default interface: %s, gateway: %s", iface, gateway)
 
-    # 3. CRITICAL: Remove the 'src' pinning from the default route if it exists.
-    #    This allows the kernel to automatically use the new IP after we delete the old one.
-    if src:
-        logger.info("Removing 'src %s' pinning from default route...", src)
-        try:
-            subprocess.run(
-                ['ip', '-6', 'route', 'replace', 'default', 'via', gateway, 'dev', iface],
-                check=True, capture_output=True, text=True
-            )
-            logger.info("Default route updated (src constraint removed).")
-        except subprocess.CalledProcessError as e:
-            logger.error("Failed to update default route: %s", e.stderr)
-            sys.exit(1)
-    else:
-        logger.info("Default route has no 'src' constraint. Good to go.")
+    logger.info("正在检查并设置系统 IPv6 优先...")
+    ensure_ipv6_preference()
 
-    # 4. Get current global IPv6 addresses
-    addrs = get_global_ipv6_addresses(iface)
-    if not addrs:
-        logger.error("No global IPv6 address found on %s", iface)
+    logger.info("开始自动检测网络接口和 IPv6 /64 前缀...")
+    INTERFACE, IPV6_PREFIX = auto_detect_interface_and_prefix()
+    logger.info(f"自动检测完成：接口 = {INTERFACE}，/64 前缀 = {IPV6_PREFIX}")
+
+    current_ip = get_current_global_ip()
+    if not current_ip:
+        logger.error(f"在接口 {INTERFACE} 上未找到全局 IPv6 地址")
         sys.exit(1)
-    logger.info("Current IPv6 addresses: %s", addrs)
 
-    # Determine the address we will manage (prefer the one used as src in route, else pick first)
-    if src and any(src == a.split('/')[0] for a in addrs):
-        for a in addrs:
-            if a.startswith(src + '/'):
-                current_addr = a
-                break
-    if current_addr is None:
-        current_addr = addrs[0]
-    logger.info("Managed address: %s", current_addr)
+    logger.info(f"启动 IPv6 轮换守护进程，初始 IP: {current_ip}")
+    logger.info(f"流量阈值: {THRESHOLD_BYTES/(1024**3):.1f} GB，检查间隔: {CHECK_INTERVAL}s")
 
-    # 5. Set up traffic counting
-    setup_iptables()
-    atexit.register(cleanup_iptables)
+    setup_iptables_rule(current_ip, action="add")
+    logger.info(f"已为 {current_ip} 添加 ip6tables 计数规则")
 
-    last_count = get_download_bytes()
-    total_traffic = 0
+    first_loop = True
 
-    logger.info("Monitoring started (threshold = %d bytes, %d GB)",
-                THRESHOLD, THRESHOLD // (1024 ** 3))
+    try:
+        while True:
+            traffic = get_traffic_for_ip(current_ip)
+            traffic_gb = traffic / (1024 ** 3)
+            logger.info(f"当前 IP {current_ip} 累计流量: {traffic} 字节 ({traffic_gb:.2f} GB)")
 
-    # 6. Main loop
-    while running:
-        time.sleep(CHECK_INTERVAL)
-        if not running:
-            break
-
-        try:
-            current_count = get_download_bytes()
-            if last_count is not None:
-                delta = current_count - last_count
-                if delta < 0:
-                    logger.warning("Counter decreased (possibly reset), ignoring")
-                    delta = 0
-                total_traffic += delta
-                logger.debug("Delta: %d bytes, Total: %d bytes (%.2f GB)",
-                             delta, total_traffic, total_traffic / (1024 ** 3))
-
-                if total_traffic >= THRESHOLD:
-                    logger.info("Threshold reached! Total traffic: %d bytes (%.2f GB)",
-                                total_traffic, total_traffic / (1024 ** 3))
-                    if replace_ipv6_address():
-                        # Reset last_count to current count after rotation
-                        last_count = get_download_bytes()
-                        logger.info("Counter reset after rotation.")
-                    else:
-                        logger.error("Address rotation failed. Counter not reset.")
+            if traffic > THRESHOLD_BYTES :
+                old_ip = current_ip
+                current_ip = switch_ip(old_ip)
+                logger.info(f"切换完成，新 IP: {current_ip}")
+                process_old_ips()
+            elif first_loop :
+                old_ip = current_ip
+                current_ip = switch_ip(old_ip)
+                logger.info(f"第一次运行, 切换完成，新 IP: {current_ip}")
+                process_old_ips()
             else:
-                last_count = current_count
+                process_old_ips()
 
-        except Exception as e:
-            logger.exception("Error in monitoring loop: %s", e)
+            time.sleep(CHECK_INTERVAL)
+            first_loop = False
 
-    logger.info("Exiting gracefully")
+    except KeyboardInterrupt:
+        logger.info("收到中断信号，正在清理...")
+        cleanup_all(current_ip)
+        sys.exit(0)
+    except Exception as e:
+        logger.exception(f"发生未预期错误: {e}")
+        cleanup_all(current_ip)
+        sys.exit(1)
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
