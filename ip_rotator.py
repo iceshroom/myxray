@@ -279,7 +279,9 @@ def delete_old_ip(ip):
 
 
 def set_route_src(ip :str) :
-    run_cmd(f"ip -6 route replace default via {GATEWAY} dev {INTERFACE} src {ip}")
+    out = run_cmd(f"ip -6 route replace default via {GATEWAY} dev {INTERFACE} src {ip}")
+    if out :
+        logger.warning(f"路由src 设置失败: {out}")
     logger.info(f"已设置路由src IP: {ip}")
 
 
@@ -348,7 +350,7 @@ def main():
 
     logger.info("开始自动检测网络接口和 IPv6 /64 前缀...")
     INTERFACE, GATEWAY, IPV6_PREFIX = auto_detect_interface_gw_and_prefix()
-    logger.info(f"自动检测完成：接口 = {INTERFACE}，/64 前缀 = {IPV6_PREFIX}")
+    logger.info(f"自动检测完成：接口 = {INTERFACE}, 网关 = {GATEWAY}, /64 前缀 = {IPV6_PREFIX}")
 
     current_ip = get_current_global_ip()
     if not current_ip:
