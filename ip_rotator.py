@@ -43,7 +43,7 @@ old_ips = []  # 元素为字典：{'ip': str, 'expire_at': datetime}
 INTERFACE = None
 GATEWAY = None
 IPV6_PREFIX = None
-ROUTE_METRIX = None
+ROUTE_METRIC = None
 
 def run_cmd(cmd, check=False):
     """执行 shell 命令，返回 stdout 字符串"""
@@ -132,7 +132,7 @@ def ensure_ipv6_preference():
 
     logger.info("IPv6 优先配置已生效。当前已运行的进程不受影响，新启动的进程将优先使用 IPv6。")
 
-def auto_detect_interface_gw_prefix_routemetrix():
+def auto_detect_interface_gw_prefix_routemetric():
     """
     自动检测默认路由接口，并从该接口获取第一个全局 IPv6 地址，提取 /64 前缀。
     若无默认路由，则遍历所有接口，选择第一个有全局 IPv6 地址的接口。
@@ -141,15 +141,15 @@ def auto_detect_interface_gw_prefix_routemetrix():
     iface = None
     gw = None
     prefix = None
-    metrix = None
+    metric = None
     outs = run_cmd("ip -6 route show default").split("\n")
     for out in outs:
-        metrix_match = re.search(r'metric\s+(\S+)', out)
-        if metrix_match :
-            cur_metrix = metrix_match.group(1)
-            if metrix != None and int(cur_metrix) >= int(metrix) :
+        metric_match = re.search(r'metric\s+(\S+)', out)
+        if metric_match :
+            cur_metric = metric_match.group(1)
+            if metric != None and int(cur_metric) >= int(metric) :
                 continue
-            metrix = cur_metrix
+            metric = cur_metric
         
         dev_match = re.search(r'dev\s+(\S+)', out)
         if dev_match:
@@ -177,8 +177,8 @@ def auto_detect_interface_gw_prefix_routemetrix():
             gw = gw_match.group(1)
         
 
-    if iface and gw and prefix and metrix:
-        return iface, gw, prefix, metrix
+    if iface and gw and prefix and metric:
+        return iface, gw, prefix, metric
 
     logger.error("未能成功检测到可用的接口和 /64 前缀")
     sys.exit(1)
@@ -287,7 +287,7 @@ def delete_old_ip(ip):
 
 
 def set_route_src(ip :str) :
-    run_cmd(f"ip -6 route replace default via {GATEWAY} dev {INTERFACE} src {ip} metrix {ROUTE_METRIX}", check=True)
+    run_cmd(f"ip -6 route replace default via {GATEWAY} dev {INTERFACE} src {ip} metric {ROUTE_METRIC}", check=True)
     logger.info(f"已设置路由src IP: {ip}")
 
 
@@ -343,7 +343,7 @@ def sigterm_handler(signal_num, frame) :
 
 
 def main():
-    global current_ip, keeprun, INTERFACE, GATEWAY, IPV6_PREFIX, ROUTE_METRIX
+    global current_ip, keeprun, INTERFACE, GATEWAY, IPV6_PREFIX, ROUTE_METRIC
 
     signal.signal(signal.SIGTERM, sigterm_handler)
 
@@ -355,9 +355,9 @@ def main():
     ensure_ipv6_preference()
 
     logger.info("开始自动检测网络接口和 IPv6 /64 前缀...")
-    INTERFACE, GATEWAY, IPV6_PREFIX, ROUTE_METRIX = auto_detect_interface_gw_prefix_routemetrix()
-    ROUTE_METRIX = str(max(0, int(ROUTE_METRIX) - 100))
-    logger.info(f"自动检测完成：接口 = {INTERFACE}, 网关 = {GATEWAY}, /64 前缀 = {IPV6_PREFIX}, Metrix = {ROUTE_METRIX}")
+    INTERFACE, GATEWAY, IPV6_PREFIX, ROUTE_METRIC = auto_detect_interface_gw_prefix_routemetric()
+    ROUTE_METRIC = str(max(0, int(ROUTE_METRIC) - 100))
+    logger.info(f"自动检测完成：接口 = {INTERFACE}, 网关 = {GATEWAY}, /64 前缀 = {IPV6_PREFIX}, Metric = {ROUTE_METRIC}")
 
     current_ip = get_current_global_ip()
     if not current_ip:
