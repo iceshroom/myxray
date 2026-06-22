@@ -266,7 +266,7 @@ def is_ip_active_in_conntrack(ip):
         return bool(out)
 
 def add_new_ip(ip):
-    run_cmd(f"ip -6 addr add {ip}/64 dev {INTERFACE}", check=True)
+    run_cmd(f"ip -6 addr add {ip}/64 dev {INTERFACE} nodad", check=True)
     logger.info(f"已添加新 IP: {ip}")
 
 def deprecate_old_ip(ip):
@@ -279,9 +279,7 @@ def delete_old_ip(ip):
 
 
 def set_route_src(ip :str) :
-    out = run_cmd(f"ip -6 route replace default via {GATEWAY} dev {INTERFACE} src {ip}")
-    if out :
-        logger.warning(f"路由src 设置失败: {out}")
+    run_cmd(f"ip -6 route replace default via {GATEWAY} dev {INTERFACE} src {ip}", check=True)
     logger.info(f"已设置路由src IP: {ip}")
 
 
