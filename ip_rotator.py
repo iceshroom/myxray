@@ -178,7 +178,7 @@ def auto_detect_interface_gw_prefix_routemetrix():
         
 
     if iface and gw and prefix and metrix:
-        return iface, gw, prefix
+        return iface, gw, prefix, metrix
 
     logger.error("未能成功检测到可用的接口和 /64 前缀")
     sys.exit(1)
