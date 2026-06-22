@@ -20,10 +20,11 @@ import logging
 from datetime import datetime, timedelta
 import ipaddress
 import shutil
+import signal
 
 # ================== 可配置参数 ==================
-THRESHOLD_BYTES = 2 * 1024 ** 3        # 触发切换的流量阈值（2GB）
-CHECK_INTERVAL = 60                    # 主循环检查间隔（秒）
+THRESHOLD_BYTES = 4 * 1024 ** 3        # 触发切换的流量阈值（4GB）
+CHECK_INTERVAL = 10                    # 主循环检查间隔（秒）
 GRACE_PERIOD = 300                     # 旧 IP 宽限期（秒），超时后强制删除
 VALID_LFT = 3600                       # 旧 IP 的有效生存时间（秒），需大于 GRACE_PERIOD
 # ===============================================
@@ -40,6 +41,7 @@ logger = logging.getLogger(__name__)
 current_ip = None
 old_ips = []  # 元素为字典：{'ip': str, 'expire_at': datetime}
 INTERFACE = None
+GATEWAY = None
 IPV6_PREFIX = None
 
 def run_cmd(cmd, check=False):
@@ -129,17 +131,20 @@ def ensure_ipv6_preference():
 
     logger.info("IPv6 优先配置已生效。当前已运行的进程不受影响，新启动的进程将优先使用 IPv6。")
 
-def auto_detect_interface_and_prefix():
+def auto_detect_interface_gw_and_prefix():
     """
     自动检测默认路由接口，并从该接口获取第一个全局 IPv6 地址，提取 /64 前缀。
     若无默认路由，则遍历所有接口，选择第一个有全局 IPv6 地址的接口。
     返回 (interface, prefix)
     """
+    iface = None
+    gw = None
+    prefix = None
     out = run_cmd("ip -6 route show default")
     if out:
-        match = re.search(r'dev\s+(\S+)', out)
-        if match:
-            iface = match.group(1)
+        dev_match = re.search(r'dev\s+(\S+)', out)
+        if dev_match:
+            iface = dev_match.group(1)
             logger.info(f"通过默认路由检测到接口: {iface}")
             addr_out = run_cmd(f"ip -6 addr show dev {iface} scope global")
             if addr_out:
@@ -149,42 +154,23 @@ def auto_detect_interface_and_prefix():
                     prefix_len = int(match_addr.group(2))
                     if prefix_len == 64:
                         prefix = get_prefix_from_address(addr_str, 64)
-                        return iface, prefix
                     else:
                         logger.warning(f"接口 {iface} 地址 {addr_str} 的前缀长度不是 /64，而是 /{prefix_len}，将截取为 /64")
                         prefix = get_prefix_from_address(addr_str, 64)
-                        if prefix:
-                            return iface, prefix
-                        else:
+                        if not prefix:
                             logger.error("无法从地址生成 /64 前缀")
                 else:
                     logger.warning(f"接口 {iface} 虽然有全局地址，但解析失败")
             else:
                 logger.warning(f"默认路由接口 {iface} 没有全局 IPv6 地址，尝试其他接口")
 
-    logger.info("未从默认路由获取到有效接口，尝试遍历所有接口...")
-    out = run_cmd("ip -6 addr show scope global")
-    if not out:
-        logger.error("系统中没有任何全局 IPv6 地址")
-        sys.exit(1)
+        gw_match = re.search(r'default via\s+(\S+)', out)
+        if gw_match :
+            gw = dev_match.group(1)
+            logger.info(f"通过默认路由检测到网关: {gw}")
 
-    lines = out.split('\n')
-    current_iface = None
-    for line in lines:
-        iface_match = re.match(r'\d+:\s+(\S+):', line)
-        if iface_match:
-            current_iface = iface_match.group(1)
-        addr_match = re.search(r'inet6 ([0-9a-f:]+)/(\d+)', line)
-        if addr_match and current_iface:
-            addr_str = addr_match.group(1)
-            prefix_len = int(addr_match.group(2))
-            logger.info(f"在接口 {current_iface} 上找到地址 {addr_str}/{prefix_len}")
-            prefix = get_prefix_from_address(addr_str, 64)
-            if prefix:
-                return current_iface, prefix
-            else:
-                logger.error(f"无法从地址 {addr_str} 生成 /64 前缀")
-                sys.exit(1)
+    if iface and gw and prefix :
+        return iface, gw, prefix
 
     logger.error("未能成功检测到可用的接口和 /64 前缀")
     sys.exit(1)
@@ -291,7 +277,13 @@ def delete_old_ip(ip):
     run_cmd(f"ip -6 addr del {ip}/64 dev {INTERFACE}", check=True)
     logger.info(f"已删除旧 IP: {ip}")
 
-def switch_ip(old_ip):
+
+def set_route_src(ip :str) :
+    run_cmd(f"ip -6 route replace default via {GATEWAY} dev {INTERFACE} src {ip}")
+    logger.info(f"已设置路由src IP: {ip}")
+
+
+def switch_ip(old_ip :str, need_deprecate_old_ip :bool = True):
     new_ip = generate_new_ip()
     while new_ip == old_ip:
         new_ip = generate_new_ip()
@@ -300,11 +292,14 @@ def switch_ip(old_ip):
     add_new_ip(new_ip)
     setup_iptables_rule(old_ip, action="del")
     setup_iptables_rule(new_ip, action="add")
-    deprecate_old_ip(old_ip)
-    expire_at = datetime.now() + timedelta(seconds=GRACE_PERIOD)
-    old_ips.append({'ip': old_ip, 'expire_at': expire_at})
-    logger.info(f"旧 IP {old_ip} 将在 {GRACE_PERIOD}s 后（{expire_at.strftime('%H:%M:%S')}）被尝试删除")
+    set_route_src(new_ip)
+    if need_deprecate_old_ip :
+        deprecate_old_ip(old_ip)
+        expire_at = datetime.now() + timedelta(seconds=GRACE_PERIOD)
+        old_ips.append({'ip': old_ip, 'expire_at': expire_at})
+        logger.info(f"旧 IP {old_ip} 将在 {GRACE_PERIOD}s 后（{expire_at.strftime('%H:%M:%S')}）被尝试删除")
     return new_ip
+
 
 def process_old_ips():
     global old_ips
@@ -332,8 +327,17 @@ def cleanup_all(ip):
         setup_iptables_rule(entry['ip'], action="del")
     logger.info("清理完成")
 
+
+keeprun = True
+def sigterm_handler(signal_num, frame) :
+    global keeprun
+    keeprun = False
+
+
 def main():
-    global current_ip, INTERFACE, IPV6_PREFIX
+    global current_ip, keeprun, INTERFACE, GATEWAY, IPV6_PREFIX
+
+    signal.signal(signal.SIGTERM, sigterm_handler)
 
     if os.geteuid() != 0:
         logger.error("本脚本需要 root 权限运行（请使用 sudo）")
@@ -343,7 +347,7 @@ def main():
     ensure_ipv6_preference()
 
     logger.info("开始自动检测网络接口和 IPv6 /64 前缀...")
-    INTERFACE, IPV6_PREFIX = auto_detect_interface_and_prefix()
+    INTERFACE, GATEWAY, IPV6_PREFIX = auto_detect_interface_gw_and_prefix()
     logger.info(f"自动检测完成：接口 = {INTERFACE}，/64 前缀 = {IPV6_PREFIX}")
 
     current_ip = get_current_global_ip()
@@ -351,35 +355,29 @@ def main():
         logger.error(f"在接口 {INTERFACE} 上未找到全局 IPv6 地址")
         sys.exit(1)
 
+    current_ip = switch_ip(current_ip, False)
+    logger.info(f"第一次运行, 保留旧ip, 添加一个新 IP: {current_ip}")
+
     logger.info(f"启动 IPv6 轮换守护进程，初始 IP: {current_ip}")
     logger.info(f"流量阈值: {THRESHOLD_BYTES/(1024**3):.1f} GB，检查间隔: {CHECK_INTERVAL}s")
 
     setup_iptables_rule(current_ip, action="add")
     logger.info(f"已为 {current_ip} 添加 ip6tables 计数规则")
 
-    first_loop = True
-
     try:
-        while True:
+        while keeprun:
             traffic = get_traffic_for_ip(current_ip)
             traffic_gb = traffic / (1024 ** 3)
             logger.info(f"当前 IP {current_ip} 累计流量: {traffic} 字节 ({traffic_gb:.2f} GB)")
 
             if traffic > THRESHOLD_BYTES :
-                old_ip = current_ip
-                current_ip = switch_ip(old_ip)
+                current_ip = switch_ip(current_ip)
                 logger.info(f"切换完成，新 IP: {current_ip}")
-                process_old_ips()
-            elif first_loop :
-                old_ip = current_ip
-                current_ip = switch_ip(old_ip)
-                logger.info(f"第一次运行, 切换完成，新 IP: {current_ip}")
                 process_old_ips()
             else:
                 process_old_ips()
 
             time.sleep(CHECK_INTERVAL)
-            first_loop = False
 
     except KeyboardInterrupt:
         logger.info("收到中断信号，正在清理...")
@@ -389,6 +387,9 @@ def main():
         logger.exception(f"发生未预期错误: {e}")
         cleanup_all(current_ip)
         sys.exit(1)
+
+    cleanup_all(current_ip)
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()
