@@ -24,7 +24,7 @@ import signal
 
 # ================== 可配置参数 ==================
 THRESHOLD_BYTES = 4 * 1024 ** 3        # 触发切换的流量阈值（4GB）
-CHECK_INTERVAL = 10                    # 主循环检查间隔（秒）
+CHECK_INTERVAL = 5                    # 主循环检查间隔（秒）
 GRACE_PERIOD = 300                     # 旧 IP 宽限期（秒），超时后强制删除
 VALID_LFT = 3600                       # 旧 IP 的有效生存时间（秒），需大于 GRACE_PERIOD
 # ===============================================
@@ -166,7 +166,7 @@ def auto_detect_interface_gw_and_prefix():
 
         gw_match = re.search(r'default via\s+(\S+)', out)
         if gw_match :
-            gw = dev_match.group(1)
+            gw = gw_match.group(1)
             logger.info(f"通过默认路由检测到网关: {gw}")
 
     if iface and gw and prefix :
