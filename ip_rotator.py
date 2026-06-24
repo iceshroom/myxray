@@ -23,7 +23,7 @@ import shutil
 import signal
 
 # ================== 可配置参数 ==================
-THRESHOLD_BYTES = 4 * 1024 ** 3        # 触发切换的流量阈值（4GB）
+THRESHOLD_BYTES = 1 * 1024 ** 3        # 触发切换的流量阈值（1GB）
 CHECK_INTERVAL = 5                    # 主循环检查间隔（秒）
 GRACE_PERIOD = 300                     # 旧 IP 宽限期（秒），超时后强制删除
 VALID_LFT = 3600                       # 旧 IP 的有效生存时间（秒），需大于 GRACE_PERIOD
