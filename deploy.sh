@@ -18,9 +18,9 @@ NC='\033[0m'
 GITHUB_REPO="iceshroom/myxray"            # 你的GitHub仓库
 PYTHON_SCRIPT_NAME="ip_rotator.py"              # Python脚本文件名
 XRAY_PORT=443                                   # Xray监听端口
-REALITY_DEST="store.steampowered.com:443"            # Reality伪装目标
-SERVER_NAME="store.steampowered.com" # SNI列表
-SERVERS_JSON='["store.steampowered.com"]'
+REALITY_DEST="console.vultr.com:443"            # Reality伪装目标
+SERVER_NAME="console.vultr.com" # SNI列表
+SERVERS_JSON='["console.vultr.com"]'
 SHORT_ID=""                                     # 留空自动生成
 CLIENT_CONFIG_PATH="$HOME/myxray/client-config.json"          # 客户端配置输出路径
 
