@@ -23,7 +23,7 @@ import shutil
 import signal
 
 # ================== 可配置参数 ==================
-THRESHOLD_BYTES = 1 * 1024 ** 3        # 触发切换的流量阈值（1GB）
+THRESHOLD_BYTES = 4 * 1024 ** 3        # 触发切换的流量阈值（1GB）
 CHECK_INTERVAL = 5                    # 主循环检查间隔（秒）
 GRACE_PERIOD = 300                     # 旧 IP 宽限期（秒），超时后强制删除
 VALID_LFT = 3600                       # 旧 IP 的有效生存时间（秒），需大于 GRACE_PERIOD
@@ -374,13 +374,16 @@ def main():
     logger.info(f"已为 {current_ip} 添加 ip6tables 计数规则")
 
     try:
+        expire_at = datetime.now() + timedelta(seconds=GRACE_PERIOD) #每过GRACE_PERIOD秒自动更换一次ip
         while keeprun:
             traffic = get_traffic_for_ip(current_ip)
+            cur_time = datetime.now()
             traffic_gb = traffic / (1024 ** 3)
             logger.info(f"当前 IP {current_ip} 累计流量: {traffic} 字节 ({traffic_gb:.2f} GB)")
 
-            if traffic > THRESHOLD_BYTES :
+            if traffic > THRESHOLD_BYTES or cur_time >= expire_at:
                 current_ip = switch_ip(current_ip)
+                expire_at = datetime.now() + timedelta(seconds=GRACE_PERIOD)
                 logger.info(f"切换完成，新 IP: {current_ip}")
                 process_old_ips()
             else:
