@@ -242,8 +242,8 @@ def setup_iptables_rule(ip, action="add"):
         run_cmd(f"ip6tables -I OUTPUT -s {ip} -j ACCEPT", check=True)
         logger.debug(f"已添加 {ip} 的计数规则")
     else:  # delete
-        run_cmd(f"ip6tables -D INPUT -d {ip} 2>/dev/null")
-        run_cmd(f"ip6tables -D OUTPUT -s {ip} 2>/dev/null")
+        run_cmd(f"ip6tables -D INPUT -d {ip} -j ACCEPT", check=True)
+        run_cmd(f"ip6tables -D OUTPUT -s {ip} -j ACCEPT", check=True)
         logger.debug(f"已删除 {ip} 的计数规则")
 
 def get_traffic_for_ip(ip):
@@ -291,6 +291,11 @@ def set_route_src(ip :str) :
     logger.info(f"已设置路由src IP: {ip}")
 
 
+def del_route_src(ip :str) :
+    run_cmd(f"ip -6 route del default via {GATEWAY} dev {INTERFACE} src {ip} metric {ROUTE_METRIC}", check=True)
+    logger.info(f"已删除路由src IP: {ip}")
+
+
 def switch_ip(old_ip :str, need_deprecate_old_ip :bool = True):
     new_ip = generate_new_ip()
     while new_ip == old_ip:
@@ -329,10 +334,12 @@ def process_old_ips():
 
 def cleanup_all(ip):
     if ip:
+        del_route_src(ip)
         setup_iptables_rule(ip, action="del")
         logger.info(f"已清理 {ip} 的 ip6tables 规则")
     for entry in old_ips:
         setup_iptables_rule(entry['ip'], action="del")
+        delete_old_ip(entry['ip'])
     logger.info("清理完成")
 
 
