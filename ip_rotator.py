@@ -336,6 +336,7 @@ def cleanup_all(ip):
     if ip:
         del_route_src(ip)
         setup_iptables_rule(ip, action="del")
+        delete_old_ip(ip)
         logger.info(f"已清理 {ip} 的 ip6tables 规则")
     for entry in old_ips:
         setup_iptables_rule(entry['ip'], action="del")
