@@ -292,7 +292,7 @@ def set_route_src(ip :str) :
 
 
 def del_route_src(ip :str) :
-    run_cmd(f"ip -6 route del default via {GATEWAY} dev {INTERFACE} src {ip} metric {ROUTE_METRIC}", check=True)
+    run_cmd(f"ip -6 route del default via {GATEWAY} dev {INTERFACE} src {ip} metric {ROUTE_METRIC}")
     logger.info(f"已删除路由src IP: {ip}")
 
 
