@@ -306,7 +306,6 @@ def switch_ip(old_ip :str, need_deprecate_old_ip :bool = True):
     setup_iptables_rule(new_ip, action="add")
     set_route_src(new_ip)
     if need_deprecate_old_ip :
-        setup_iptables_rule(old_ip, action="del")
         deprecate_old_ip(old_ip)
         expire_at = datetime.now() + timedelta(seconds=GRACE_PERIOD)
         old_ips.append({'ip': old_ip, 'expire_at': expire_at})
