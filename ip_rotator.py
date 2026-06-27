@@ -366,21 +366,19 @@ def main():
     ROUTE_METRIC = str(max(0, int(ROUTE_METRIC) - 100))
     logger.info(f"自动检测完成：接口 = {INTERFACE}, 网关 = {GATEWAY}, /64 前缀 = {IPV6_PREFIX}, Metric = {ROUTE_METRIC}")
 
-    current_ip = get_current_global_ip()
-    if not current_ip:
+    start_ip = get_current_global_ip()
+    if not start_ip:
         logger.error(f"在接口 {INTERFACE} 上未找到全局 IPv6 地址")
         sys.exit(1)
 
-    current_ip = switch_ip(current_ip, False)
-    logger.info(f"第一次运行, 保留旧ip, 添加一个新 IP: {current_ip}")
-
-    logger.info(f"启动 IPv6 轮换守护进程，初始 IP: {current_ip}")
-    logger.info(f"流量阈值: {THRESHOLD_BYTES/(1024**3):.1f} GB，检查间隔: {CHECK_INTERVAL}s")
-
-    setup_iptables_rule(current_ip, action="add")
-    logger.info(f"已为 {current_ip} 添加 ip6tables 计数规则")
-
+    exit_code = 0
     try:
+        current_ip = switch_ip(start_ip, False)
+        logger.info(f"第一次运行, 保留旧ip, 添加一个新 IP: {current_ip}")
+        logger.info(f"启动 IPv6 轮换守护进程，初始 IP: {current_ip}")
+        logger.info(f"流量阈值: {THRESHOLD_BYTES/(1024**3):.1f} GB，检查间隔: {CHECK_INTERVAL}s")
+        setup_iptables_rule(current_ip, action="add")
+        logger.info(f"已为 {current_ip} 添加 ip6tables 计数规则")
         expire_at = datetime.now() + timedelta(seconds=GRACE_PERIOD) #每过GRACE_PERIOD秒自动更换一次ip
         while keeprun:
             traffic = get_traffic_for_ip(current_ip)
@@ -402,9 +400,10 @@ def main():
         logger.info("收到中断信号，正在清理...")
     except Exception as e:
         logger.exception(f"发生未预期错误: {e}")
+        exit_code = -1
     finally :
         cleanup_all(current_ip)
-    sys.exit(0)
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()
