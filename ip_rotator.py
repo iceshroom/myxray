@@ -400,14 +400,10 @@ def main():
 
     except KeyboardInterrupt:
         logger.info("收到中断信号，正在清理...")
-        cleanup_all(current_ip)
-        sys.exit(0)
     except Exception as e:
         logger.exception(f"发生未预期错误: {e}")
+    finally :
         cleanup_all(current_ip)
-        sys.exit(1)
-
-    cleanup_all(current_ip)
     sys.exit(0)
 
 if __name__ == "__main__":
