@@ -322,7 +322,10 @@ def process_old_ips():
         expire_at = entry['expire_at']
         if now >= expire_at:
             if is_ip_active_in_conntrack(ip):
-                logger.warning(f"旧 IP {ip} 已超时但 conntrack 仍显示活跃，强制删除")
+                logger.warning(f"旧 IP {ip} 已超时但 conntrack 仍显示活跃")
+                entry['expire_at'] = datetime.now() + timedelta(seconds=GRACE_PERIOD)
+                logger.info(f"旧 IP {ip} 将在 {GRACE_PERIOD}s 后（{expire_at.strftime('%H:%M:%S')}）被尝试删除")
+                continue
             else:
                 logger.info(f"旧 IP {ip} 已超时且 conntrack 无活跃，安全删除")
             setup_iptables_rule(ip, action="del")
