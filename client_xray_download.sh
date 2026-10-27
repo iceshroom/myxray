@@ -93,7 +93,7 @@ update_xray() {
 
 # --- 获取 geo 文件的最新发布时间 ---
 get_latest_geo_time() {
-    curl -s https://github.com/XTLS/Xray-rules-dat/releases/latest | jq -r .published_at
+    curl -s https://api.github.com/repos/XTLS/Xray-rules-dat/releases/latest | jq -r .published_at
 }
 
 # --- 下载单个 geo 文件 ---
