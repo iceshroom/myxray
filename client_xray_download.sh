@@ -99,14 +99,16 @@ get_latest_geo_time() {
 # --- 下载单个 geo 文件 ---
 download_geo() {
     local file="$1"
+    local name="$2"
     echo "⬇️  下载 $file ..."
-    curl -# -L -o "$BIN_DIR/$file" "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/$file"
-    echo "✅ $file 已保存至 $BIN_DIR/$file"
+    curl -# -L -o "$BIN_DIR/$name" "https://github.com/XTLS/Xray-rules-dat/releases/latest/download/$file"
+    echo "✅ $file 已保存至 $BIN_DIR/$name"
 }
 
 # --- 更新单个 geo 文件（通过发布时间比较） ---
 update_geo() {
     local file="$1"
+    local name="$2"
     local remote_time
     remote_time=$(get_latest_geo_time)
     if [ -z "$remote_time" ]; then
@@ -115,7 +117,7 @@ update_geo() {
     fi
 
     if [ ! -f "$BIN_DIR/$file" ]; then
-        download_geo "$file"
+        download_geo "$file" "$name"
         return
     fi
 
@@ -140,8 +142,8 @@ main() {
     check_deps
     echo "📁 工作目录: $BIN_DIR"
     update_xray
-    update_geo "geoip.dat"
-    update_geo "geosite.dat"
+    update_geo "geoip-full.dat" "geoip.dat"
+    update_geo "geosite-expand.dat" "geosite.dat"
     echo "🎉 所有组件已就绪！"
 }
 
